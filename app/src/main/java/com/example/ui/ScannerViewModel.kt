@@ -42,6 +42,9 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     private val DATACENTER_FILTER_KEY = stringPreferencesKey("datacenter_filter")
     
     init {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            com.example.scanner.ScannerEngine.initialize(application)
+        }
         val database = AppDatabase.getDatabase(application)
         repository = IpRepository(database.scannedIpDao(), database.syncRuleDao())
         
@@ -56,7 +59,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     targetIpCount = prefs[TARGET_IP_KEY] ?: 2000f,
                     targetValidIpCount = prefs[TARGET_VALID_KEY] ?: 10f,
                     targetAllValidIpCount = prefs[TARGET_ALL_VALID_KEY] ?: 100f,
-                    workerApiUrl = prefs[API_URL_KEY] ?: "proxyipsinp.xxxxxxx.nyc.mn",
+                    workerApiUrl = prefs[API_URL_KEY] ?: "proxyip.xxxxxxx.nyc.mn",
                     dataCenterFilter = savedFilter,
                     activeFilters = if (savedFilter.isBlank()) setOf("ALL") else savedFilter.split(",").map { it.trim() }.filter { it.isNotEmpty() }.toSet()
                 )
@@ -128,6 +131,9 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     fun startScan() {
         if (_uiState.value.isScanning) return
         
+        // Ensure ScannerEngine is initialized before starting
+        com.example.scanner.ScannerEngine.initialize(getApplication())
+        
         // Grab local IPs before clearing the state
         val localIps = _uiState.value.validIps.map { it.ip }.distinct()
         
@@ -144,27 +150,30 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             val dataCenters = _uiState.value.dataCenterFilter.split(",").map { it.trim().uppercase() }.filter { it.isNotEmpty() && it != "ALL" }
             val chunkSize = _uiState.value.concurrentThreads.toInt()
             val activeChips = _uiState.value.activeFilters
-            val targetValidCount = if (activeChips.contains("ALL")) {
-                _uiState.value.targetAllValidIpCount.toInt()
-            } else {
-                _uiState.value.targetValidIpCount.toInt()
-            }
+            val targetValidCount = _uiState.value.targetValidIpCount.toInt()
             val targetAllCount = _uiState.value.targetAllValidIpCount.toInt()
+            val hasAll = activeChips.contains("ALL")
+            val specificChips = activeChips.filter { it != "ALL" }
+            val hasSpecific = specificChips.isNotEmpty()
 
             var isFirstRound = true
             
             while (isActive) {
                 val totalValid = _uiState.value.validIps.size
-                val currentValidMatches = if (activeChips.contains("ALL")) {
-                     totalValid
-                } else {
-                     _uiState.value.validIps.count { activeChips.contains(it.colo.uppercase()) }
+                val currentValidMatches = _uiState.value.validIps.count { specificChips.contains(it.colo.uppercase()) }
+                
+                var shouldStop = true
+                if (hasAll && totalValid < targetAllCount) {
+                    shouldStop = false
                 }
-                if (activeChips.contains("ALL")) {
-                    if (totalValid >= targetAllCount) break
-                } else {
-                    if (currentValidMatches >= targetValidCount) break
+                if (hasSpecific && currentValidMatches < targetValidCount) {
+                    shouldStop = false
                 }
+                if (!hasAll && !hasSpecific) {
+                    if (totalValid < targetAllCount) shouldStop = false
+                }
+                
+                if (shouldStop) break
                 
                 val ipsToTest = if (isFirstRound && localIps.isNotEmpty()) {
                     isFirstRound = false
@@ -172,27 +181,32 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 } else {
                     isFirstRound = false
                     val seeds = (localIps + _uiState.value.validIps.map { it.ip }).distinct()
-                    if (seeds.isNotEmpty()) {
+                    val generated = if (seeds.isNotEmpty()) {
                         ScannerEngine.generateIpsAroundSeeds(seeds, ipsToGeneratePerRound)
                     } else {
                         ScannerEngine.generateRandomIps(ipsToGeneratePerRound)
                     }
+                    generated.distinct()
                 }
                 
                 for (chunk in ipsToTest.chunked(chunkSize)) {
                     if (!isActive) break
                     
                     val totalValidInner = _uiState.value.validIps.size
-                    val innerValidMatches = if (activeChips.contains("ALL")) {
-                         totalValidInner
-                    } else {
-                         _uiState.value.validIps.count { activeChips.contains(it.colo.uppercase()) }
+                    val innerValidMatches = _uiState.value.validIps.count { specificChips.contains(it.colo.uppercase()) }
+                    
+                    var innerShouldStop = true
+                    if (hasAll && totalValidInner < targetAllCount) {
+                        innerShouldStop = false
                     }
-                    if (activeChips.contains("ALL")) {
-                        if (totalValidInner >= targetAllCount) break
-                    } else {
-                        if (innerValidMatches >= targetValidCount) break
+                    if (hasSpecific && innerValidMatches < targetValidCount) {
+                        innerShouldStop = false
                     }
+                    if (!hasAll && !hasSpecific) {
+                        if (totalValidInner < targetAllCount) innerShouldStop = false
+                    }
+                    
+                    if (innerShouldStop) break
                     
                     val jobs = chunk.map { ip ->
                         launch {
@@ -317,18 +331,13 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     fun setFilter(colo: String) {
         val current = _uiState.value.activeFilters.toMutableSet()
-        if (colo == "ALL") {
-            current.clear()
-            current.add("ALL")
+        if (current.contains(colo)) {
+            current.remove(colo)
         } else {
-            current.remove("ALL")
-            if (current.contains(colo)) {
-                current.remove(colo)
-            } else {
-                current.add(colo)
-            }
-            if (current.isEmpty()) current.add("ALL")
+            current.add(colo)
         }
+        if (current.isEmpty()) current.add("ALL")
+        
         val newFilterStr = current.joinToString(",")
         updateDataCenterFilter(newFilterStr)
     }
@@ -416,7 +425,7 @@ data class ScannerUiState(
     val validIps: List<ScannedIp> = emptyList(),
     val activeFilters: Set<String> = setOf("ALL"),
     val useCloudApi: Boolean = true,
-    val workerApiUrl: String = "proxyipsinp.xxxxxxx.nyc.mn",
+    val workerApiUrl: String = "proxyip.xxxxxxx.nyc.mn",
     val concurrentThreads: Float = 100f,
     val maxLatency: Float = 350f,
     val targetIpCount: Float = 2000f,
